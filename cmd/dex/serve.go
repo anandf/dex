@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -50,6 +51,8 @@ type serveOptions struct {
 	webHTTPSAddr  string
 	telemetryAddr string
 	grpcAddr      string
+	storageType   string
+	storageConfig string
 }
 
 var buildInfo = prometheus.NewGaugeVec(
@@ -85,6 +88,8 @@ func commandServe() *cobra.Command {
 	flags.StringVar(&options.webHTTPSAddr, "web-https-addr", "", "Web HTTPS address")
 	flags.StringVar(&options.telemetryAddr, "telemetry-addr", "", "Telemetry address")
 	flags.StringVar(&options.grpcAddr, "grpc-addr", "", "gRPC API address")
+	flags.StringVar(&options.storageType, "storage-type", "", "storage type for storing tokens")
+	flags.StringVar(&options.storageConfig, "storage-config", "", "configuration for the configured storage type")
 
 	return cmd
 }
@@ -101,7 +106,18 @@ func runServe(options serveOptions) error {
 		return fmt.Errorf("error parse config file %s: %v", configFile, err)
 	}
 
-	applyConfigOverrides(options, &c)
+	if options.storageType == "" {
+		options.storageType = os.Getenv("DEX_STORAGE_TYPE")
+	}
+
+	if options.storageConfig == "" {
+		options.storageConfig = os.Getenv("DEX_STORAGE_CONFIG")
+	}
+
+	err = applyConfigOverrides(options, &c)
+	if err != nil {
+		return fmt.Errorf("error overriding values for storage type %q and storage config: %v", options.storageType, err)
+	}
 
 	logger, err := newLogger(c.Logger.Level, c.Logger.Format)
 	if err != nil {
@@ -640,7 +656,7 @@ func parseCurvePreferences(names []string) ([]tls.CurveID, error) {
 	return curves, nil
 }
 
-func applyConfigOverrides(options serveOptions, config *Config) {
+func applyConfigOverrides(options serveOptions, config *Config) error {
 	if options.webHTTPAddr != "" {
 		config.Web.HTTP = options.webHTTPAddr
 	}
@@ -671,6 +687,40 @@ func applyConfigOverrides(options serveOptions, config *Config) {
 			"urn:ietf:params:oauth:grant-type:token-exchange",
 		}
 	}
+
+	if options.storageType != "" {
+		f, ok := storages[options.storageType]
+		if !ok {
+			return fmt.Errorf("unknown storage type %q", options.storageType)
+		}
+		storageConfig := f()
+		if len(options.storageConfig) != 0 {
+			data := []byte(options.storageConfig)
+			if featureflags.ExpandEnv.Enabled() {
+				var rawMap map[string]any
+				if err := json.Unmarshal(data, &rawMap); err != nil {
+					return fmt.Errorf("unmarshal config for env expansion: %v", err)
+				}
+
+				// Recursively expand environment variables in the map to avoid
+				// issues with JSON special characters and escapes
+				expandEnvInMap(rawMap)
+
+				// Marshal the expanded map back to JSON
+				expandedData, err := json.Marshal(rawMap)
+				if err != nil {
+					return fmt.Errorf("marshal expanded config: %v", err)
+				}
+				data = expandedData
+			}
+			if err := json.Unmarshal(data, storageConfig); err != nil {
+				return fmt.Errorf("parse storage config: %v", err)
+			}
+		}
+		config.Storage.Type = options.storageType
+		config.Storage.Config = storageConfig
+	}
+	return nil
 }
 
 func pprofHandler(router *http.ServeMux) {
